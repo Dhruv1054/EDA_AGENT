@@ -1,0 +1,12 @@
+fastapi
+uvicorn[standard]
+pandas
+matplotlib
+seaborn
+langchain
+langgraph
+streamlit
+requests
+ollama
+slowapi
+pydantic
