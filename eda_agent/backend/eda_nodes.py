@@ -9,7 +9,6 @@ import pandas as pd
 import seaborn as sns
 
 from backend.job_store import update_job
-from backend.llm_nodes import detect_semantic_type_for_column
 
 OUTPUTS_BASE = os.path.join(os.path.dirname(os.path.dirname(__file__)), "outputs")
 os.makedirs(OUTPUTS_BASE, exist_ok=True)
@@ -67,7 +66,7 @@ def _to_json_safe(v: Any) -> Any:
 
 
 def profile_columns_with_nulls(state: dict) -> dict:
-    """Node 3: Build compact metadata for columns that contain nulls."""
+    """Node 3: Build compact metadata (including stats) for columns that contain nulls."""
     _tick(state, 25, "Profiling columns with missing values")
     df: pd.DataFrame = state["df"]
     missing: dict = state.get("missing_values", {})
@@ -86,235 +85,150 @@ def profile_columns_with_nulls(state: dict) -> dict:
         non_null = s.dropna()
         sample = [_to_json_safe(x) for x in non_null.head(5).tolist()]
 
-        profiles.append(
-            {
-                "column_name": str(col),
-                "dtype": str(s.dtype),
-                "null_percentage": round((int(null_count) / n_rows) * 100.0, 3),
-                "unique_values": int(non_null.nunique(dropna=True)),
-                "sample_values": sample,
-            }
-        )
+        profile: dict = {
+            "column_name": str(col),
+            "dtype": str(s.dtype),
+            "null_count": int(null_count),
+            "null_percentage": round((int(null_count) / n_rows) * 100.0, 3),
+            "unique_values": int(non_null.nunique(dropna=True)),
+            "sample_values": sample,
+            "mean": None,
+            "median": None,
+            "skew": None,
+        }
+
+        if pd.api.types.is_numeric_dtype(s) and not non_null.empty:
+            try:
+                profile["mean"] = round(float(non_null.mean()), 4)
+                profile["median"] = round(float(non_null.median()), 4)
+                profile["skew"] = round(float(non_null.skew()), 4) if len(non_null) >= 3 else None
+            except Exception:
+                pass
+
+        profiles.append(profile)
 
     return {**state, "null_column_profiles": profiles}
 
 
-def _heuristic_semantic_type(profile: dict) -> tuple[str, str, bool]:
-    """Return (semantic_type, reason, is_confident)."""
-    name = str(profile.get("column_name", "")).lower()
-    dtype = str(profile.get("dtype", "")).lower()
-    unique = int(profile.get("unique_values") or 0)
-    samples = profile.get("sample_values") or []
+def execute_imputation_plan(state: dict) -> dict:
+    """Node 5: Dynamically execute LLM-generated imputation code on the DataFrame."""
+    _tick(state, 33, "Executing LLM imputation plan")
+    df: pd.DataFrame = state["df"].copy()
+    plan: dict = state.get("imputation_plan", {})
+    steps: list[dict] = plan.get("imputation_plan", [])
 
-    if "datetime" in dtype or "date" in dtype or "time" in dtype:
-        return ("datetime", "Datetime dtype detected.", True)
-    if dtype.startswith("bool"):
-        return ("boolean_flag", "Boolean dtype detected.", True)
-    if any(tok in name for tok in ["id", "uuid", "identifier"]):
-        # High-ish uniqueness suggests identifier; still keep conservative.
-        if unique >= 50:
-            return ("identifier", "Column name suggests identifier with many unique values.", True)
-        return ("identifier", "Column name suggests identifier.", False)
+    executed: list[dict] = []
+    # Single shared namespace so each step sees mutations from prior steps
+    exec_ns: dict = {"df": df, "pd": pd}
 
-    if any(tok in name for tok in ["is_", "has_", "flag", "active", "enabled"]):
-        return ("boolean_flag", "Column name suggests boolean flag.", False)
+    for step in steps:
+        col = step.get("column", "")
+        code = (step.get("code") or "").strip()
 
-    if dtype.startswith(("int", "float")) or "int" in dtype or "float" in dtype:
-        # Few unique numeric values often represent categories.
-        if 0 < unique <= 10:
-            return ("categorical_label", "Numeric dtype but low cardinality suggests labels.", False)
-        return ("numeric_measure", "Numeric dtype suggests a measurable quantity.", True)
-
-    # Object/string heuristics: free text vs labels.
-    if dtype in {"object", "string"}:
-        avg_len = 0.0
-        if samples:
-            lens = [len(str(x)) for x in samples if x is not None]
-            avg_len = sum(lens) / max(len(lens), 1)
-        if avg_len >= 30:
-            return ("free_text", "Long sample strings suggest free-form text.", True)
-        return ("categorical_label", "String dtype with short samples suggests labels.", False)
-
-    return ("categorical_label", "Default fallback.", False)
-
-
-def detect_semantic_type_for_each_null_column(state: dict) -> dict:
-    """Node 4: Detect semantic type for each null-containing column.
-
-    Uses heuristics for obvious cases, otherwise calls Ollama to classify.
-    """
-    _tick(state, 28, "Detecting semantic types for null columns")
-    profiles: list[dict] = state.get("null_column_profiles", [])
-
-    semantic: dict[str, dict] = {}
-    for p in profiles:
-        col = str(p.get("column_name", ""))
-        guess, why, confident = _heuristic_semantic_type(p)
-        if confident:
-            semantic[col] = {"semantic_type": guess, "reason": why, "source": "heuristic"}
+        if not code or code.lstrip().startswith("#"):
+            executed.append({**step, "status": "skipped", "error": "No executable code"})
             continue
 
-        llm_out = detect_semantic_type_for_column(p)
-        semantic_type = llm_out.get("semantic_type") or guess
-        reason = llm_out.get("reason") or why
-        semantic[col] = {"semantic_type": semantic_type, "reason": reason, "source": "llm"}
+        try:
+            exec(code, exec_ns)  # noqa: S102
+            df = exec_ns.get("df", df)
+            executed.append({**step, "status": "success"})
+        except Exception as exc:
+            log.warning("Imputation code failed for column '%s': %s | code: %s", col, exc, code)
+            # Safe fallback
+            if col in df.columns:
+                try:
+                    if pd.api.types.is_numeric_dtype(df[col]):
+                        df[col] = df[col].fillna(df[col].median())
+                        fallback = "fallback:median"
+                    else:
+                        mode_s = df[col].mode(dropna=True)
+                        df[col] = df[col].fillna(mode_s.iloc[0] if not mode_s.empty else "Unknown")
+                        fallback = "fallback:mode"
+                    exec_ns["df"] = df
+                    executed.append({**step, "status": fallback, "error": str(exc)})
+                except Exception as fe:
+                    executed.append({**step, "status": "failed", "error": str(exc), "fallback_error": str(fe)})
+            else:
+                executed.append({**step, "status": "failed", "error": str(exc)})
 
-    return {**state, "null_semantic_types": semantic}
-
-
-STRATEGY_MAP: dict[str, str] = {
-    "numeric_measure": "median",
-    "categorical_label": "mode",
-    "boolean_flag": "mode",
-    "identifier": "leave_null",
-    "datetime": "forward_fill",
-    "free_text": "constant:Unknown",
-}
-
-ALLOWED_STRATEGIES = {"median", "mode", "constant:Unknown", "forward_fill", "leave_null"}
-
-
-def map_semantic_type_to_strategy(state: dict) -> dict:
-    """Node 5: Deterministically map semantic types to allowed strategies."""
-    _tick(state, 29, "Mapping semantic types to imputation strategies")
-    semantic: dict = state.get("null_semantic_types", {})
-    strategies: dict[str, str] = {}
-
-    for col, info in semantic.items():
-        stype = str(info.get("semantic_type", "categorical_label"))
-        strategy = STRATEGY_MAP.get(stype, "mode")
-        if strategy not in ALLOWED_STRATEGIES:
-            strategy = "mode"
-        strategies[str(col)] = strategy
-
-    return {**state, "imputation_strategies": strategies}
+    return {**state, "df": df, "executed_imputation_steps": executed}
 
 
-def apply_imputation(state: dict) -> dict:
-    """Node 6: Apply deterministic imputation strategies using pandas."""
-    _tick(state, 30, "Filling missing values")
-    df: pd.DataFrame = state["df"].copy()
+def generate_imputation_report(state: dict) -> dict:
+    """Node 6: Build structured imputation report from executed plan steps."""
+    _tick(state, 36, "Generating imputation report")
     missing: dict = state.get("missing_values", {})
-    semantic: dict = state.get("null_semantic_types", {})
-    strategies: dict = state.get("imputation_strategies", {})
+    executed: list[dict] = state.get("executed_imputation_steps", [])
 
     fill_logic: list[dict] = []
     report_lines: list[str] = []
 
-    for col, null_count in missing.items():
-        if col not in df.columns:
-            continue
-        n_missing = int(null_count)
-        if n_missing <= 0:
-            continue
-
-        sem = semantic.get(col, {})
-        sem_type = str(sem.get("semantic_type", "categorical_label"))
-        strategy_key = str(strategies.get(col, STRATEGY_MAP.get(sem_type, "mode")))
-
-        fill_value_str = ""
-        reason = str(sem.get("reason", "")).strip() or "Semantic classification."
-
-        try:
-            if strategy_key == "leave_null":
-                pass
-            elif strategy_key == "forward_fill":
-                df[col] = df[col].ffill()
-            elif strategy_key == "constant:Unknown":
-                df[col] = df[col].fillna("Unknown")
-                fill_value_str = "Unknown"
-            elif strategy_key == "median":
-                fill_val = None
-                try:
-                    fill_val = df[col].median()
-                except Exception:
-                    fill_val = None
-                if fill_val is None or (isinstance(fill_val, float) and pd.isna(fill_val)) or pd.isna(fill_val):
-                    # Fallbacks for all-null / non-computable median
-                    mode_s = df[col].mode(dropna=True)
-                    if not mode_s.empty:
-                        fill_val = mode_s.iloc[0]
-                        df[col] = df[col].fillna(fill_val)
-                    else:
-                        strategy_key = "leave_null"
-                else:
-                    df[col] = df[col].fillna(fill_val)
-                if strategy_key != "leave_null":
-                    fill_value_str = str(round(float(fill_val), 4)) if isinstance(fill_val, float) else str(fill_val)
-            elif strategy_key == "mode":
-                mode_s = df[col].mode(dropna=True)
-                if not mode_s.empty:
-                    fill_val = mode_s.iloc[0]
-                    df[col] = df[col].fillna(fill_val)
-                    fill_value_str = str(round(float(fill_val), 4)) if isinstance(fill_val, float) else str(fill_val)
-                else:
-                    # Safe fallback if mode cannot be computed (e.g., all-null)
-                    strategy_key = "leave_null"
-            else:
-                # Should not happen, but keep safe
-                strategy_key = "leave_null"
-        except Exception as exc:
-            log.warning("Imputation failed for column %s with %s: %s", col, strategy_key, exc)
-            strategy_key = "leave_null"
-            reason = f"{reason} (imputation error: {exc})"
-
-        strategy_display = {
-            "median": "Median",
-            "mode": "Mode",
-            "forward_fill": "Forward Fill",
-            "leave_null": "Leave Null",
-            "constant:Unknown": "Constant:Unknown",
-        }.get(strategy_key, "Leave Null")
+    for step in executed:
+        col = step.get("column", "")
+        null_count = int(missing.get(col, 0))
+        sem_type = step.get("semantic_type", "")
+        condition = step.get("condition", "")
+        strategy = step.get("strategy", "")
+        status = step.get("status", "")
+        reason = step.get("reason", "")
 
         fill_logic.append(
             {
                 "column": col,
-                "missing_before": n_missing,
+                "missing_before": null_count,
                 "semantic_type": sem_type,
-                "strategy": strategy_display,
-                "strategy_key": strategy_key,
-                "fill_value": fill_value_str,
+                "condition": condition,
+                "strategy": strategy,
+                "status": status,
                 "reason": reason,
             }
         )
         report_lines.append(
-            f"- Column: {col} | Null Count: {n_missing} | Detected Type: {sem_type} | Strategy: {strategy_key}"
+            f"- Column: {col} | Type: {sem_type} | Condition: {condition} "
+            f"| Strategy: {strategy} | Status: {status}"
         )
+
+    imputation_report = {
+        "columns": [
+            {
+                "column": s.get("column", ""),
+                "semantic_type": s.get("semantic_type", ""),
+                "condition": s.get("condition", ""),
+                "strategy": s.get("strategy", ""),
+            }
+            for s in executed
+        ]
+    }
+
+    null_report = "Null Handling Report:\n" + (
+        "\n".join(report_lines) if report_lines else "✅ No missing values to handle."
+    )
 
     return {
         **state,
-        "df": df,
         "fill_logic": fill_logic,
-        "null_handling_report": "Null Handling Report:\n" + ("\n".join(report_lines) if report_lines else "✅ No missing values to handle."),
+        "imputation_report": imputation_report,
+        "null_handling_report": null_report,
     }
 
 
-# Backwards-compatible wrapper (kept for compatibility; graph no longer uses it)
-def fill_missing_values(state: dict) -> dict:
-    """Legacy Node: preserved name for compatibility."""
-    # If invoked directly, run the new flow using existing state where possible.
-    state = profile_columns_with_nulls(state)
-    state = detect_semantic_type_for_each_null_column(state)
-    state = map_semantic_type_to_strategy(state)
-    return apply_imputation(state)
-
-
 def detect_duplicates(state: dict) -> dict:
-    """Node 4: Count duplicate rows (after imputation)."""
+    """Node 7: Count duplicate rows (after imputation)."""
     _tick(state, 40, "Detecting duplicate rows")
     df: pd.DataFrame = state["df"]
     return {**state, "duplicate_count": int(df.duplicated().sum())}
 
 
 def remove_duplicates(state: dict) -> dict:
-    """Node 5: Drop duplicate rows — keep first occurrence."""
+    """Node 8: Drop duplicate rows — keep first occurrence."""
     _tick(state, 50, "Removing duplicates")
-    df: pd.DataFrame  = state["df"]
-    dup_count: int    = state.get("duplicate_count", 0)
-    df_clean          = df.drop_duplicates().reset_index(drop=True)
+    df: pd.DataFrame = state["df"]
+    dup_count: int = state.get("duplicate_count", 0)
+    df_clean = df.drop_duplicates().reset_index(drop=True)
     dup_logic = {
         "duplicates_found": dup_count,
-        "strategy":         "Keep First Occurrence",
+        "strategy": "Keep First Occurrence",
         "reason": (
             "Exact duplicate rows carry no new information and bias "
             "statistical results. The first occurrence is retained "
@@ -325,11 +239,11 @@ def remove_duplicates(state: dict) -> dict:
 
 
 def generate_charts(state: dict) -> dict:
-    """Node 6: Histogram, boxplot, correlation heatmap — scoped to session dir."""
+    """Node 9: Histogram, boxplot, correlation heatmap — scoped to session dir."""
     _tick(state, 62, "Generating charts")
     df: pd.DataFrame = state["df"]
-    session_id       = state.get("session_id", "default")
-    out_dir          = _session_dir(session_id)
+    session_id = state.get("session_id", "default")
+    out_dir = _session_dir(session_id)
     charts: list[str] = []
 
     numeric_cols = df.select_dtypes(include="number").columns.tolist()
@@ -367,7 +281,7 @@ def generate_charts(state: dict) -> dict:
     # Correlation heatmap
     if len(numeric_cols) >= 2:
         corr = df[numeric_cols].corr()
-        sz   = max(6, len(numeric_cols))
+        sz = max(6, len(numeric_cols))
         fig, ax = plt.subplots(figsize=(sz, sz - 1))
         sns.heatmap(corr, annot=True, fmt=".2f", cmap="coolwarm",
                     ax=ax, linewidths=0.5, square=True)
@@ -382,25 +296,25 @@ def generate_charts(state: dict) -> dict:
 
 
 def generate_summary(state: dict) -> dict:
-    """Node 7: Comprehensive dataset summary + important facts list."""
+    """Node 10: Comprehensive dataset summary + important facts list."""
     _tick(state, 75, "Building dataset summary")
-    df: pd.DataFrame  = state["df"]
-    missing: dict     = state.get("missing_values", {})
-    dup_count: int    = state.get("duplicate_count", 0)
-    null_report: str  = state.get("null_handling_report", "")
+    df: pd.DataFrame = state["df"]
+    missing: dict = state.get("missing_values", {})
+    dup_count: int = state.get("duplicate_count", 0)
+    null_report: str = state.get("null_handling_report", "")
 
     num_cols = df.select_dtypes(include="number").columns.tolist()
     cat_cols = df.select_dtypes(exclude="number").columns.tolist()
 
     summary: dict = {
-        "total_rows":               int(len(df)),
-        "total_columns":            int(len(df.columns)),
-        "numeric_column_count":     int(len(num_cols)),
+        "total_rows": int(len(df)),
+        "total_columns": int(len(df.columns)),
+        "numeric_column_count": int(len(num_cols)),
         "categorical_column_count": int(len(cat_cols)),
-        "numeric_columns":          num_cols,
-        "categorical_columns":      cat_cols,
-        "total_missing_values":     int(sum(missing.values())),
-        "duplicates_removed":       dup_count,
+        "numeric_columns": num_cols,
+        "categorical_columns": cat_cols,
+        "total_missing_values": int(sum(missing.values())),
+        "duplicates_removed": dup_count,
     }
 
     facts: list[str] = []

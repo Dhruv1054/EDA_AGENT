@@ -17,6 +17,11 @@ log = logging.getLogger(__name__)
 
 # ── Prompts ────────────────────────────────────────────────────────────────────
 
+IMPUTATION_SYSTEM_PROMPT = (
+    "You are a data preprocessing assistant. "
+    "Return only valid JSON with no extra text or markdown."
+)
+
 SYSTEM_PROMPT = """You are a senior data analyst assistant.
 You receive a JSON summary of an already-cleaned dataset and provide concise,
 factual, non-hallucinated insights.
@@ -97,6 +102,180 @@ Do not return any extra text.
             "semantic_type": "categorical_label",
             "reason": f"Fallback classification used (LLM unavailable/invalid): {exc}",
         }
+
+
+# ── Imputation plan generator (LangGraph node) ─────────────────────────────────
+
+def _fallback_imputation_plan(profiles: list[dict]) -> dict:
+    """Rule-based fallback plan used when LLM is unavailable or returns invalid JSON."""
+    steps: list[dict] = []
+    for p in profiles:
+        col: str = p.get("column_name", "")
+        dtype: str = str(p.get("dtype", "")).lower()
+        skew = p.get("skew")
+        null_pct: float = float(p.get("null_percentage") or 0)
+        unique: int = int(p.get("unique_values") or 0)
+        samples: list = p.get("sample_values") or []
+
+        # Escape single quotes in column name for safe code generation
+        col_esc = col.replace("\\", "\\\\").replace("'", "\\'")
+
+        if "datetime" in dtype or "date" in dtype or "time" in dtype:
+            sem, condition, strategy = "datetime", "datetime_series", "forward_fill"
+            code = f"df['{col_esc}'] = df['{col_esc}'].ffill()"
+
+        elif dtype.startswith("bool"):
+            sem, condition, strategy = "boolean_flag", "categorical_low_cardinality", "mode"
+            code = (
+                f"_mv = df['{col_esc}'].mode(); "
+                f"df['{col_esc}'] = df['{col_esc}'].fillna(_mv.iloc[0] if not _mv.empty else False)"
+            )
+
+        elif dtype.startswith(("int", "float")) or "int" in dtype or "float" in dtype:
+            sem = "numeric_measure"
+            if null_pct > 50:
+                condition, strategy = "high_null_percentage", "median"
+                code = f"df['{col_esc}'] = df['{col_esc}'].fillna(df['{col_esc}'].median())"
+            elif skew is not None and abs(float(skew)) > 1.0:
+                condition, strategy = "numeric_skewed", "median"
+                code = f"df['{col_esc}'] = df['{col_esc}'].fillna(df['{col_esc}'].median())"
+            else:
+                condition, strategy = "numeric_non_skewed", "mean"
+                code = f"df['{col_esc}'] = df['{col_esc}'].fillna(df['{col_esc}'].mean())"
+
+        elif dtype in {"object", "string"} or "object" in dtype:
+            name_lower = col.lower()
+            if any(tok in name_lower for tok in ["id", "uuid", "identifier", "key", "code"]):
+                sem, condition, strategy = "identifier", "identifier_column", "leave_null"
+                code = f"# '{col_esc}' is an identifier — left as null"
+            else:
+                avg_len = 0.0
+                if samples:
+                    lens = [len(str(x)) for x in samples if x is not None]
+                    avg_len = sum(lens) / max(len(lens), 1)
+                if avg_len >= 30:
+                    sem, condition, strategy = "free_text", "text_column", "constant_unknown"
+                    code = f"df['{col_esc}'] = df['{col_esc}'].fillna('Unknown')"
+                elif unique <= 10:
+                    sem, condition, strategy = "categorical_label", "categorical_low_cardinality", "mode"
+                    code = (
+                        f"_mv = df['{col_esc}'].mode(); "
+                        f"df['{col_esc}'] = df['{col_esc}'].fillna(_mv.iloc[0] if not _mv.empty else 'Unknown')"
+                    )
+                else:
+                    sem, condition, strategy = "categorical_label", "categorical_high_cardinality", "mode"
+                    code = (
+                        f"_mv = df['{col_esc}'].mode(); "
+                        f"df['{col_esc}'] = df['{col_esc}'].fillna(_mv.iloc[0] if not _mv.empty else 'Unknown')"
+                    )
+        else:
+            sem, condition, strategy = "categorical_label", "categorical_low_cardinality", "mode"
+            code = (
+                f"_mv = df['{col_esc}'].mode(); "
+                f"df['{col_esc}'] = df['{col_esc}'].fillna(_mv.iloc[0] if not _mv.empty else 'Unknown')"
+            )
+
+        steps.append(
+            {
+                "column": col,
+                "semantic_type": sem,
+                "condition": condition,
+                "strategy": strategy,
+                "reason": "Fallback rule-based classification (LLM unavailable or returned invalid JSON).",
+                "code": code,
+            }
+        )
+    return {"imputation_plan": steps}
+
+
+def generate_imputation_plan_using_llm(state: dict) -> dict:
+    """LangGraph Node: Ask LLaMA3 to produce a column-level imputation plan with pandas code."""
+    job_id = state.get("job_id", "")
+    if job_id:
+        update_job(job_id, progress=28, stage="Generating LLM imputation plan")
+
+    profiles: list[dict] = state.get("null_column_profiles", [])
+    if not profiles:
+        return {**state, "imputation_plan": {"imputation_plan": []}}
+
+    user_prompt = f"""You are a data preprocessing assistant.
+Your task is to generate a column-level imputation plan for missing values.
+For each column, analyze metadata and:
+1. Identify semantic type:
+   - numeric_measure
+   - categorical_label
+   - boolean_flag
+   - identifier
+   - datetime
+   - free_text
+2. Determine condition with more granularity:
+   - numeric_skewed
+   - numeric_non_skewed
+   - categorical_low_cardinality
+   - categorical_high_cardinality
+   - identifier_column
+   - text_column
+   - datetime_series
+   - high_null_percentage
+3. Select imputation strategy using rules:
+- numeric + skewed → median
+- numeric + non-skewed → mean
+- categorical → mode
+- boolean → mode
+- free_text → "Unknown"
+- identifier → leave null
+- datetime → forward fill
+4. Generate executable pandas code using df
+5. Return STRICT JSON:
+{{
+  "imputation_plan": [
+    {{
+      "column": "...",
+      "semantic_type": "...",
+      "condition": "...",
+      "strategy": "...",
+      "reason": "...",
+      "code": "..."
+    }}
+  ]
+}}
+Do NOT return anything outside JSON.
+
+Column profiles:
+{json.dumps(profiles, indent=2)}
+"""
+
+    try:
+        response = ollama_client.chat(
+            model="llama3:8b-instruct-q4_K_M",
+            messages=[
+                {"role": "system", "content": IMPUTATION_SYSTEM_PROMPT},
+                {"role": "user", "content": user_prompt},
+            ],
+            format="json",
+            options={"temperature": 0.0, "num_predict": 1200},
+        )
+        raw = response["message"]["content"]
+        plan: dict = json.loads(raw) if isinstance(raw, str) else {}
+
+        # Validate structure
+        if "imputation_plan" not in plan or not isinstance(plan["imputation_plan"], list):
+            raise ValueError(f"Missing or invalid 'imputation_plan' key in LLM response: {raw[:200]}")
+
+        # Ensure every step has the required keys; patch missing ones defensively
+        required_keys = {"column", "semantic_type", "condition", "strategy", "reason", "code"}
+        for step in plan["imputation_plan"]:
+            for k in required_keys:
+                if k not in step:
+                    step[k] = ""
+
+        log.info("LLM generated imputation plan with %d steps.", len(plan["imputation_plan"]))
+
+    except Exception as exc:
+        log.warning("LLM imputation plan generation failed (%s) — using fallback.", exc)
+        plan = _fallback_imputation_plan(profiles)
+
+    return {**state, "imputation_plan": plan}
 
 
 # ── Context builder ────────────────────────────────────────────────────────────
