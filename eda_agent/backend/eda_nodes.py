@@ -1,3 +1,4 @@
+import json
 import os
 import logging
 from typing import Any
@@ -125,6 +126,13 @@ def execute_imputation_plan(state: dict) -> dict:
         col = step.get("column", "")
         code = (step.get("code") or "").strip()
 
+        print("\n---------------------------")
+        print("Column:", step.get("column"))
+        print("Type:", step.get("semantic_type"))
+        print("Condition:", step.get("condition"))
+        print("Strategy:", step.get("strategy"))
+        print("Code:", code)
+
         if not code or code.lstrip().startswith("#"):
             executed.append({**step, "status": "skipped", "error": "No executable code"})
             continue
@@ -134,6 +142,7 @@ def execute_imputation_plan(state: dict) -> dict:
             df = exec_ns.get("df", df)
             executed.append({**step, "status": "success"})
         except Exception as exc:
+            print(f"Error executing code for column {step.get('column')}: {exc}")
             log.warning("Imputation code failed for column '%s': %s | code: %s", col, exc, code)
             # Safe fallback
             if col in df.columns:
@@ -151,6 +160,12 @@ def execute_imputation_plan(state: dict) -> dict:
                     executed.append({**step, "status": "failed", "error": str(exc), "fallback_error": str(fe)})
             else:
                 executed.append({**step, "status": "failed", "error": str(exc)})
+
+    print("\n=== DATAFRAME AFTER IMPUTATION ===")
+    print(df.head(10))
+
+    print("\n=== NULL COUNTS AFTER IMPUTATION ===")
+    print(df.isnull().sum())
 
     return {**state, "df": df, "executed_imputation_steps": executed}
 

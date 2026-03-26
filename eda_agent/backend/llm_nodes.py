@@ -271,9 +271,21 @@ Column profiles:
 
         log.info("LLM generated imputation plan with %d steps.", len(plan["imputation_plan"]))
 
+        print("\n=== IMPUTATION PLAN JSON ===")
+        print(json.dumps(plan, indent=2))
+
+        with open("imputation_plan.json", "w") as f:
+            json.dump(plan, f, indent=2)
+
     except Exception as exc:
         log.warning("LLM imputation plan generation failed (%s) — using fallback.", exc)
         plan = _fallback_imputation_plan(profiles)
+
+        print("\n=== IMPUTATION PLAN JSON (fallback) ===")
+        print(json.dumps(plan, indent=2))
+
+        with open("imputation_plan.json", "w") as f:
+            json.dump(plan, f, indent=2)
 
     return {**state, "imputation_plan": plan}
 
