@@ -155,6 +155,16 @@ def execute_imputation_plan(state: dict) -> dict:
     return {**state, "df": df, "executed_imputation_steps": executed}
 
 
+_STRATEGY_FILL_LABEL: dict[str, str] = {
+    "median":           "median value",
+    "mean":             "mean value",
+    "mode":             "mode value",
+    "forward_fill":     "forward filled",
+    "leave_null":       "—",
+    "constant_unknown": "Unknown",
+}
+
+
 def generate_imputation_report(state: dict) -> dict:
     """Node 6: Build structured imputation report from executed plan steps."""
     _tick(state, 36, "Generating imputation report")
@@ -172,6 +182,8 @@ def generate_imputation_report(state: dict) -> dict:
         strategy = step.get("strategy", "")
         status = step.get("status", "")
         reason = step.get("reason", "")
+        # Derive a human-readable fill label for the frontend
+        fill_value = _STRATEGY_FILL_LABEL.get(strategy.lower(), strategy or "—")
 
         fill_logic.append(
             {
@@ -180,6 +192,7 @@ def generate_imputation_report(state: dict) -> dict:
                 "semantic_type": sem_type,
                 "condition": condition,
                 "strategy": strategy,
+                "fill_value": fill_value,
                 "status": status,
                 "reason": reason,
             }
