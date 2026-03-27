@@ -1,28 +1,28 @@
-"""LLM layer — strictly read-only interpretation.
-Receives serialised stats JSON → returns text/structured JSON.
-Never mutates the DataFrame or any deterministic pipeline state.
+"""LLM layer — two-step imputation pipeline + insights + chat.
+
+Step 1: generate_imputation_plan  → LLM returns strict JSON plan (no code)
+Step 2: generate_python_code_from_plan → LLM returns pure Python code
 """
 from __future__ import annotations
 
-import logging
 import json
+import logging
+import re
 from typing import Any
 
-import ollama
 from ollama import Client
 
 from backend.job_store import update_job
 
 log = logging.getLogger(__name__)
 
-# ── Prompts ────────────────────────────────────────────────────────────────────
+# ── Ollama client ──────────────────────────────────────────────────────────────
+ollama_client = Client(timeout=300)
 
-IMPUTATION_SYSTEM_PROMPT = (
-    "You are a data preprocessing assistant. "
-    "Return only valid JSON with no extra text or markdown."
-)
-
-SYSTEM_PROMPT = """You are a senior data analyst assistant.
+# ── System prompts ─────────────────────────────────────────────────────────────
+_PLAN_SYSTEM   = "You are a data preprocessing assistant. Return only valid JSON with no extra text."
+_CODE_SYSTEM   = "You are a Python code generator. Return only valid Python code. No markdown, no explanations."
+_INSIGHT_SYSTEM = """You are a senior data analyst assistant.
 You receive a JSON summary of an already-cleaned dataset and provide concise,
 factual, non-hallucinated insights.
 
@@ -36,171 +36,108 @@ Rules:
 
 MAX_HISTORY_TURNS = 6
 
-# Initialize global client with a long timeout for local LLM inference
-ollama_client = Client(timeout=300)
 
-# ── Missing-value semantic classifier (helper; NOT a LangGraph node) ────────────
+# ── Internal helpers ───────────────────────────────────────────────────────────
 
-SEMANTIC_TYPES = {
-    "numeric_measure",
-    "categorical_label",
-    "boolean_flag",
-    "identifier",
-    "datetime",
-    "free_text",
-}
+def _strip_markdown(text: str) -> str:
+    """Remove ```python / ``` fences the LLM may add despite instructions."""
+    text = re.sub(r"```(?:python)?\s*", "", text)
+    text = re.sub(r"```", "", text)
+    return text.strip()
 
 
-def detect_semantic_type_for_column(profile: dict) -> dict:
-    """Return semantic type classification for a single column profile.
-
-    This helper is intentionally side-effect free. It does NOT impute values; it
-    only returns a semantic label + reason so deterministic pandas logic can act.
-    """
-    prompt = f"""You are a data preprocessing assistant.
-Your task is to classify a dataset column into one of these semantic types:
-- numeric_measure
-- categorical_label
-- boolean_flag
-- identifier
-- datetime
-- free_text
-Column Metadata:
-Column Name: {profile.get("column_name")}
-Data Type: {profile.get("dtype")}
-Null Percentage: {profile.get("null_percentage")}
-Unique Values: {profile.get("unique_values")}
-Sample Values: {profile.get("sample_values")}
-Return strictly valid JSON in this format:
-{{
- "semantic_type": "...",
- "reason": "..."
-}}
-Do not return any extra text.
-"""
-
-    try:
-        response = ollama_client.chat(
-            model="llama3:8b-instruct-q4_K_M",
-            messages=[
-                {"role": "system", "content": "You are a data preprocessing assistant."},
-                {"role": "user", "content": prompt},
-            ],
-            format="json",
-            options={"temperature": 0.0, "num_predict": 200},
-        )
-        raw = response["message"]["content"]
-        data = json.loads(raw) if isinstance(raw, str) else {}
-        semantic_type = str(data.get("semantic_type", "")).strip()
-        reason = str(data.get("reason", "")).strip() or "No reason provided."
-        if semantic_type not in SEMANTIC_TYPES:
-            raise ValueError(f"Invalid semantic_type: {semantic_type!r}")
-        return {"semantic_type": semantic_type, "reason": reason}
-    except Exception as exc:
-        log.warning("Semantic detection failed for %s: %s", profile.get("column_name"), exc)
-        return {
-            "semantic_type": "categorical_label",
-            "reason": f"Fallback classification used (LLM unavailable/invalid): {exc}",
-        }
-
-
-# ── Imputation plan generator (LangGraph node) ─────────────────────────────────
-
-def _fallback_imputation_plan(profiles: list[dict]) -> dict:
-    """Rule-based fallback plan used when LLM is unavailable or returns invalid JSON."""
+def _fallback_plan(profiles: list[dict]) -> dict:
+    """Rule-based plan (Step 1 fallback) — same JSON schema as the LLM."""
     steps: list[dict] = []
     for p in profiles:
-        col: str = p.get("column_name", "")
-        dtype: str = str(p.get("dtype", "")).lower()
-        skew = p.get("skew")
-        null_pct: float = float(p.get("null_percentage") or 0)
-        unique: int = int(p.get("unique_values") or 0)
-        samples: list = p.get("sample_values") or []
-
-        # Escape single quotes in column name for safe code generation
-        col_esc = col.replace("\\", "\\\\").replace("'", "\\'")
+        col      = p.get("column_name", "")
+        dtype    = str(p.get("dtype", "")).lower()
+        skew     = p.get("skew")
+        null_pct = float(p.get("null_percentage") or 0)
+        unique   = int(p.get("unique_values") or 0)
+        samples  = p.get("sample_values") or []
 
         if "datetime" in dtype or "date" in dtype or "time" in dtype:
-            sem, condition, strategy = "datetime", "datetime_series", "forward_fill"
-            code = f"df['{col_esc}'] = df['{col_esc}'].ffill()"
-
+            sem, cond, strat = "datetime", "datetime_series", "forward_fill"
         elif dtype.startswith("bool"):
-            sem, condition, strategy = "boolean_flag", "categorical_low_cardinality", "mode"
-            code = (
-                f"_mv = df['{col_esc}'].mode(); "
-                f"df['{col_esc}'] = df['{col_esc}'].fillna(_mv.iloc[0] if not _mv.empty else False)"
-            )
-
+            sem, cond, strat = "boolean_flag", "categorical_low_cardinality", "mode"
         elif dtype.startswith(("int", "float")) or "int" in dtype or "float" in dtype:
             sem = "numeric_measure"
             if null_pct > 50:
-                condition, strategy = "high_null_percentage", "median"
-                code = f"df['{col_esc}'] = df['{col_esc}'].fillna(df['{col_esc}'].median())"
+                cond, strat = "high_null_percentage", "median"
             elif skew is not None and abs(float(skew)) > 1.0:
-                condition, strategy = "numeric_skewed", "median"
-                code = f"df['{col_esc}'] = df['{col_esc}'].fillna(df['{col_esc}'].median())"
+                cond, strat = "numeric_skewed", "median"
             else:
-                condition, strategy = "numeric_non_skewed", "mean"
-                code = f"df['{col_esc}'] = df['{col_esc}'].fillna(df['{col_esc}'].mean())"
-
-        elif dtype in {"object", "string"} or "object" in dtype:
-            name_lower = col.lower()
-            if any(tok in name_lower for tok in ["id", "uuid", "identifier", "key", "code"]):
-                sem, condition, strategy = "identifier", "identifier_column", "leave_null"
-                code = f"# '{col_esc}' is an identifier — left as null"
+                cond, strat = "numeric_non_skewed", "mean"
+        elif "object" in dtype or "string" in dtype:
+            name_l = col.lower()
+            if any(t in name_l for t in ["id", "uuid", "identifier", "key", "code"]):
+                sem, cond, strat = "identifier", "identifier_column", "leave_null"
             else:
-                avg_len = 0.0
-                if samples:
-                    lens = [len(str(x)) for x in samples if x is not None]
-                    avg_len = sum(lens) / max(len(lens), 1)
+                avg_len = (sum(len(str(x)) for x in samples if x) / max(len(samples), 1)) if samples else 0
                 if avg_len >= 30:
-                    sem, condition, strategy = "free_text", "text_column", "constant_unknown"
-                    code = f"df['{col_esc}'] = df['{col_esc}'].fillna('Unknown')"
+                    sem, cond, strat = "free_text", "text_column", "constant_unknown"
                 elif unique <= 10:
-                    sem, condition, strategy = "categorical_label", "categorical_low_cardinality", "mode"
-                    code = (
-                        f"_mv = df['{col_esc}'].mode(); "
-                        f"df['{col_esc}'] = df['{col_esc}'].fillna(_mv.iloc[0] if not _mv.empty else 'Unknown')"
-                    )
+                    sem, cond, strat = "categorical_label", "categorical_low_cardinality", "mode"
                 else:
-                    sem, condition, strategy = "categorical_label", "categorical_high_cardinality", "mode"
-                    code = (
-                        f"_mv = df['{col_esc}'].mode(); "
-                        f"df['{col_esc}'] = df['{col_esc}'].fillna(_mv.iloc[0] if not _mv.empty else 'Unknown')"
-                    )
+                    sem, cond, strat = "categorical_label", "categorical_high_cardinality", "mode"
         else:
-            sem, condition, strategy = "categorical_label", "categorical_low_cardinality", "mode"
-            code = (
-                f"_mv = df['{col_esc}'].mode(); "
-                f"df['{col_esc}'] = df['{col_esc}'].fillna(_mv.iloc[0] if not _mv.empty else 'Unknown')"
-            )
+            sem, cond, strat = "categorical_label", "categorical_low_cardinality", "mode"
 
-        steps.append(
-            {
-                "column": col,
-                "semantic_type": sem,
-                "condition": condition,
-                "strategy": strategy,
-                "reason": "Fallback rule-based classification (LLM unavailable or returned invalid JSON).",
-                "code": code,
-            }
-        )
+        steps.append({
+            "column":        col,
+            "semantic_type": sem,
+            "condition":     cond,
+            "strategy":      strat,
+            "reason":        "Fallback rule-based plan (LLM unavailable).",
+        })
     return {"imputation_plan": steps}
 
 
-def generate_imputation_plan_using_llm(state: dict) -> dict:
-    """LangGraph Node: Ask LLaMA3 to produce a column-level imputation plan with pandas code."""
+def _fallback_code_from_plan(plan: dict) -> str:
+    """Rule-based code generator (Step 2 fallback) — produces pandas code from plan."""
+    lines: list[str] = []
+    for step in plan.get("imputation_plan", []):
+        col   = step.get("column", "")
+        strat = step.get("strategy", "")
+        esc   = col.replace("\\", "\\\\").replace("'", "\\'")
+
+        if strat == "median":
+            lines.append(f"df['{esc}'] = df['{esc}'].fillna(df['{esc}'].median())")
+        elif strat == "mean":
+            lines.append(f"df['{esc}'] = df['{esc}'].fillna(df['{esc}'].mean())")
+        elif strat == "mode":
+            lines.append(f"_mv = df['{esc}'].mode(); df['{esc}'] = df['{esc}'].fillna(_mv.iloc[0] if not _mv.empty else 'Unknown')")
+        elif strat == "forward_fill":
+            lines.append(f"df['{esc}'] = df['{esc}'].ffill()")
+        elif strat in ("constant_unknown", "constant"):
+            lines.append(f"df['{esc}'] = df['{esc}'].fillna('Unknown')")
+        elif strat == "leave_null":
+            lines.append(f"# '{esc}' — identifier, left as null")
+        else:
+            lines.append(f"df['{esc}'] = df['{esc}'].fillna(df['{esc}'].mode().iloc[0] if not df['{esc}'].mode().empty else 'Unknown')")
+    return "\n".join(lines)
+
+
+# ── LangGraph Node — Step 1: Plan ──────────────────────────────────────────────
+
+def generate_imputation_plan(state: dict) -> dict:
+    """LangGraph Node — Step 1: LLM returns strict JSON plan (no pandas code)."""
     job_id = state.get("job_id", "")
     if job_id:
-        update_job(job_id, progress=28, stage="Generating LLM imputation plan")
+        update_job(job_id, progress=27, stage="Step 1 — Generating imputation plan")
 
     profiles: list[dict] = state.get("null_column_profiles", [])
     if not profiles:
+        log.info("No null columns — skipping imputation plan.")
         return {**state, "imputation_plan": {"imputation_plan": []}}
 
     user_prompt = f"""You are a data preprocessing assistant.
-Your task is to generate a column-level imputation plan for missing values.
-For each column, analyze metadata and:
+
+Your task is to generate a column-level imputation plan.
+
+For each column:
+
 1. Identify semantic type:
    - numeric_measure
    - categorical_label
@@ -208,7 +145,8 @@ For each column, analyze metadata and:
    - identifier
    - datetime
    - free_text
-2. Determine condition with more granularity:
+
+2. Determine condition:
    - numeric_skewed
    - numeric_non_skewed
    - categorical_low_cardinality
@@ -217,16 +155,18 @@ For each column, analyze metadata and:
    - text_column
    - datetime_series
    - high_null_percentage
-3. Select imputation strategy using rules:
-- numeric + skewed → median
-- numeric + non-skewed → mean
-- categorical → mode
-- boolean → mode
-- free_text → "Unknown"
-- identifier → leave null
-- datetime → forward fill
-4. Generate executable pandas code using df
-5. Return STRICT JSON:
+
+3. Select strategy:
+   - numeric + skewed → median
+   - numeric + non-skewed → mean
+   - categorical → mode
+   - boolean → mode
+   - free_text → "Unknown"
+   - identifier → leave null
+   - datetime → forward fill
+
+Return STRICT JSON:
+
 {{
   "imputation_plan": [
     {{
@@ -234,87 +174,143 @@ For each column, analyze metadata and:
       "semantic_type": "...",
       "condition": "...",
       "strategy": "...",
-      "reason": "...",
-      "code": "..."
+      "reason": "..."
     }}
   ]
 }}
-Do NOT return anything outside JSON.
+
+Do NOT include code.
+Do NOT include explanations outside JSON.
 
 Column profiles:
 {json.dumps(profiles, indent=2)}
 """
 
+    plan: dict = {}
     try:
         response = ollama_client.chat(
             model="llama3:8b-instruct-q4_K_M",
             messages=[
-                {"role": "system", "content": IMPUTATION_SYSTEM_PROMPT},
-                {"role": "user", "content": user_prompt},
+                {"role": "system", "content": _PLAN_SYSTEM},
+                {"role": "user",   "content": user_prompt},
             ],
             format="json",
-            options={"temperature": 0.0, "num_predict": 1200},
+            options={"temperature": 0.0, "num_predict": 1000},
         )
-        raw = response["message"]["content"]
-        plan: dict = json.loads(raw) if isinstance(raw, str) else {}
+        raw  = response["message"]["content"]
+        plan = json.loads(raw) if isinstance(raw, str) else {}
 
-        # Validate structure
         if "imputation_plan" not in plan or not isinstance(plan["imputation_plan"], list):
-            raise ValueError(f"Missing or invalid 'imputation_plan' key in LLM response: {raw[:200]}")
+            raise ValueError(f"Invalid plan structure: {raw[:200]}")
 
-        # Ensure every step has the required keys; patch missing ones defensively
-        required_keys = {"column", "semantic_type", "condition", "strategy", "reason", "code"}
+        required = {"column", "semantic_type", "condition", "strategy", "reason"}
         for step in plan["imputation_plan"]:
-            for k in required_keys:
+            for k in required:
                 if k not in step:
                     step[k] = ""
 
-        log.info("LLM generated imputation plan with %d steps.", len(plan["imputation_plan"]))
+        log.info("Step 1 — Plan generated for %d columns.", len(plan["imputation_plan"]))
+        print("\n=== IMPUTATION PLAN ===")
+        print(json.dumps(plan, indent=2))
 
     except Exception as exc:
-        log.warning("LLM imputation plan generation failed (%s) — using fallback.", exc)
-        plan = _fallback_imputation_plan(profiles)
+        log.warning("Step 1 LLM failed (%s) — using fallback plan.", exc)
+        plan = _fallback_plan(profiles)
 
     return {**state, "imputation_plan": plan}
 
 
-# ── Context builder ────────────────────────────────────────────────────────────
+# ── LangGraph Node — Step 2: Code ─────────────────────────────────────────────
+
+def generate_python_code_from_plan(state: dict) -> dict:
+    """LangGraph Node — Step 2: LLM returns pure Python pandas code from the plan."""
+    job_id = state.get("job_id", "")
+    if job_id:
+        update_job(job_id, progress=30, stage="Step 2 — Generating pandas code")
+
+    plan: dict = state.get("imputation_plan", {"imputation_plan": []})
+    if not plan.get("imputation_plan"):
+        return {**state, "generated_code": ""}
+
+    user_prompt = f"""You are a data preprocessing assistant.
+
+Given the following imputation plan, generate valid Python pandas code to apply it on a DataFrame named `df`.
+
+Rules:
+- Use df[...] syntax
+- Use fillna with mean/median/mode/constant/forward fill
+- Do NOT include JSON
+- Do NOT include explanations
+- Do NOT include markdown
+- Return ONLY Python code
+
+Imputation plan:
+{json.dumps(plan, indent=2)}
+"""
+
+    code: str = ""
+    try:
+        response = ollama_client.chat(
+            model="llama3:8b-instruct-q4_K_M",
+            messages=[
+                {"role": "system", "content": _CODE_SYSTEM},
+                {"role": "user",   "content": user_prompt},
+            ],
+            options={"temperature": 0.0, "num_predict": 800},
+        )
+        raw  = response["message"]["content"].strip()
+        code = _strip_markdown(raw)
+
+        if not code:
+            raise ValueError("LLM returned empty code.")
+
+        log.info("Step 2 — Code generated (%d chars).", len(code))
+        print("\n=== GENERATED CODE ===")
+        print(code)
+
+    except Exception as exc:
+        log.warning("Step 2 LLM failed (%s) — using fallback code.", exc)
+        code = _fallback_code_from_plan(plan)
+        print("\n=== GENERATED CODE (fallback) ===")
+        print(code)
+
+    return {**state, "generated_code": code}
+
+
+# ── Context builder (unchanged) ───────────────────────────────────────────────
 
 def _build_llm_context(state: dict) -> dict:
-    """Build a compact, token-efficient context dict from pipeline state."""
-    df          = state.get("df")
-    summary     = state.get("summary", {})
-    fill_logic  = state.get("fill_logic", [])
+    df         = state.get("df")
+    summary    = state.get("summary", {})
+    fill_logic = state.get("fill_logic", [])
 
     ctx: dict[str, Any] = {
-        "shape": [summary.get("total_rows"), summary.get("total_columns")],
+        "shape":   [summary.get("total_rows"), summary.get("total_columns")],
         "columns": {
             "numeric":     summary.get("numeric_columns", []),
             "categorical": summary.get("categorical_columns", []),
         },
-        "missing_values_filled": {
-            r["column"]: r["missing_before"] for r in fill_logic
-        },
-        "duplicates_removed": state.get("duplicate_count", 0),
-        "dataset_facts": summary.get("dataset_facts", []),
+        "missing_values_filled": {r["column"]: r["missing_before"] for r in fill_logic},
+        "duplicates_removed":    state.get("duplicate_count", 0),
+        "dataset_facts":         summary.get("dataset_facts", []),
     }
 
     if df is not None:
-        numeric_cols = df.select_dtypes("number").columns.tolist()
-        if numeric_cols:
-            desc = df[numeric_cols].describe()
+        num_cols = df.select_dtypes("number").columns.tolist()
+        if num_cols:
+            desc = df[num_cols].describe()
             ctx["numeric_stats"] = {
                 col: {
                     "mean": round(float(desc.loc["mean", col]), 3),
                     "std":  round(float(desc.loc["std",  col]), 3),
                     "min":  round(float(desc.loc["min",  col]), 3),
                     "max":  round(float(desc.loc["max",  col]), 3),
-                    "skew": round(float(df[col].skew()), 3) if hasattr(df[col], "skew") else 0,
+                    "skew": round(float(df[col].skew()), 3),
                 }
-                for col in numeric_cols[:5]
+                for col in num_cols[:5]
             }
-        if len(numeric_cols) >= 2:
-            corr = df[numeric_cols].corr().abs()
+        if len(num_cols) >= 2:
+            corr = df[num_cols].corr().abs()
             for c in corr.columns:
                 corr.loc[c, c] = 0.0
             top = corr.stack().nlargest(3)
@@ -324,62 +320,53 @@ def _build_llm_context(state: dict) -> dict:
     return ctx
 
 
-# ── LangGraph Node ─────────────────────────────────────────────────────────────
+# ── LangGraph Node — LLM Insights (unchanged) ─────────────────────────────────
 
 def generate_llm_insights(state: dict) -> dict:
-    """LLM Node: structured AI insights via LLaMA3 (Ollama). Read-only."""
+    """LLM Node: structured AI insights via LLaMA3. Read-only."""
     job_id = state.get("job_id", "")
     if job_id:
         update_job(job_id, progress=85, stage="Generating AI insights with LLaMA3")
 
-    ctx = _build_llm_context(state)
-
+    ctx         = _build_llm_context(state)
     user_prompt = f"""Dataset summary (JSON):
 {json.dumps(ctx, indent=2)}
 
 Respond ONLY as valid JSON matching this exact schema:
 {{
-  "key_findings":           ["finding 1", "finding 2", "finding 3"],
-  "data_quality_notes":     ["note 1", "note 2"],
-  "anomalies":              ["anomaly 1", "anomaly 2"],
-  "visual_analysis_insights":["insight from charts 1", "insight from charts 2"],
-  "recommended_next_steps": ["step 1", "step 2", "step 3"]
+  "key_findings":            ["finding 1", "finding 2", "finding 3"],
+  "data_quality_notes":      ["note 1", "note 2"],
+  "anomalies":               ["anomaly 1"],
+  "visual_analysis_insights":["insight 1", "insight 2"],
+  "recommended_next_steps":  ["step 1", "step 2"]
 }}
 
-For 'visual_analysis_insights', interpret the numeric stats (mean, std, skew) as if you were looking at Histograms, Boxplots, and Heatmaps. 
-- Mention distributions based on skewness.
-- Mention potential outliers based on min/max vs mean.
-- Mention correlation trends.
-
-Include 3-5 items in each list. Be specific — reference actual column names and numbers.
+For visual_analysis_insights interpret skew/mean/std as histogram/boxplot signals.
+Include 3-5 items per list. Reference actual column names and numbers.
 """
 
     try:
         response = ollama_client.chat(
             model="llama3:8b-instruct-q4_K_M",
             messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "system", "content": _INSIGHT_SYSTEM},
                 {"role": "user",   "content": user_prompt},
             ],
             format="json",
             options={"temperature": 0.1, "num_predict": 600},
         )
-        raw      = response["message"]["content"]
-        insights = json.loads(raw)
-        for key in ["key_findings", "data_quality_notes", "anomalies", "visual_analysis_insights", "recommended_next_steps"]:
-            if key not in insights or not isinstance(insights[key], list):
-                insights[key] = []
-
+        insights = json.loads(response["message"]["content"])
+        for k in ["key_findings", "data_quality_notes", "anomalies",
+                  "visual_analysis_insights", "recommended_next_steps"]:
+            if k not in insights or not isinstance(insights[k], list):
+                insights[k] = []
     except Exception as exc:
         insights = {
-            "key_findings":           ["⚠️ LLM unavailable — start Ollama and pull llama3:8b-instruct-q4_K_M."],
-            "data_quality_notes":     [f"Error detail: {exc}"],
-            "anomalies":              [],
-            "visual_analysis_insights": [],
-            "recommended_next_steps": [
-                "Run: ollama pull llama3:8b-instruct-q4_K_M",
-                "Then: ollama serve",
-            ],
+            "key_findings":            ["⚠️ LLM unavailable — start Ollama and pull llama3:8b-instruct-q4_K_M."],
+            "data_quality_notes":      [f"Error: {exc}"],
+            "anomalies":               [],
+            "visual_analysis_insights":[],
+            "recommended_next_steps":  ["Run: ollama pull llama3:8b-instruct-q4_K_M", "Then: ollama serve"],
         }
 
     if job_id:
@@ -388,26 +375,22 @@ Include 3-5 items in each list. Be specific — reference actual column names an
     return {**state, "llm_insights": insights, "llm_context": ctx}
 
 
-# ── Conversational helper (not a LangGraph node) ───────────────────────────────
+# ── Conversational helper (unchanged) ─────────────────────────────────────────
 
 def chat_with_data(query: str, dataset_context: dict, history: list[dict]) -> str:
-    """Direct LLM call for follow-up questions. Uses sliding window memory."""
     system = (
         "You are a concise data analyst assistant. "
         "Answer questions based ONLY on the dataset context provided. "
         "Be specific, factual, and brief (3-5 sentences max). "
-        "If the question cannot be answered from the provided data, say so clearly."
+        "If the question cannot be answered from the data, say so clearly."
     )
-
-    recent = history[-MAX_HISTORY_TURNS:]
     messages = [
         {"role": "system",    "content": system},
         {"role": "user",      "content": f"Dataset context:\n{json.dumps(dataset_context, indent=2)}"},
         {"role": "assistant", "content": "I've reviewed the dataset context. Ask me anything about it."},
+        *history[-MAX_HISTORY_TURNS:],
+        {"role": "user", "content": query},
     ]
-    messages.extend(recent)
-    messages.append({"role": "user", "content": query})
-
     try:
         response = ollama_client.chat(
             model="llama3:8b-instruct-q4_K_M",
@@ -418,6 +401,5 @@ def chat_with_data(query: str, dataset_context: dict, history: list[dict]) -> st
     except Exception as exc:
         return (
             f"⚠️ LLM unavailable: {exc}\n\n"
-            "Make sure Ollama is running:\n"
-            "```\nollama serve\nollama pull llama3:8b-instruct-q4_K_M\n```"
+            "Make sure Ollama is running:\n```\nollama serve\nollama pull llama3:8b-instruct-q4_K_M\n```"
         )
